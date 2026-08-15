@@ -1,0 +1,13 @@
+﻿CLOCK.R4X provenance
+====================
+
+Fachliche Quelle:
+- Eingefrorener Altprojekt-Commit: 259cbfac272c47ac1a7828de973512d17b29ae10
+- Urspruenglicher Pfad: Code/System/Software/Clock
+
+Transfer in R4OS 0.64.17:
+- Source und Manifest wurden aus dem eingefrorenen Commit uebernommen.
+- Der feste Library-Nachbarpfad wurde durch die gepinnte
+  r4os_libraries-Paketkante und das SDK-R4MF-Pfadmapping ersetzt.
+- Buildstarter, Settings und Repositoryhygiene sind neu; die fachliche
+  CLOCK-Implementierung blieb unveraendert.
