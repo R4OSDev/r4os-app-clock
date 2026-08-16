@@ -20,7 +20,9 @@
         "build.zig.zon",
         "src",
         "module.R4MF",
-        "README.txt",
+        "README.md",
+        "DOCUMENTATION.de.txt",
+        "THIRD_PARTY_NOTICES.md",
         "PROVENANCE.txt",
     },
 }
