@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 const r4std = @import("r4std");
 const AppApi = struct {
@@ -24,24 +25,115 @@ const text = r4os.gui.default_palette.text;
 const shadow = r4os.gui.default_palette.face_shadow;
 const hand = 0x000000;
 const second_hand = 0xA00000;
+const clock_timer_id = r4os.TimerId.init(1);
+const benchmark_gui_timer_id = r4os.TimerId.init(2);
+const time_service_name = "TIMESVC";
+const benchmark_output_path = "D:\\CLOCKPERF.TXT";
+const benchmark_error_path = "D:\\CLOCKERR.TXT";
+const clock_second_ns: u64 = 1_000_000_000;
+const benchmark_gui_interval_ns: u64 = 100_000_000;
+const time_service_timeout_ns: u64 = 1_000_000_000;
+const benchmark_seconds: u64 = 10;
+const timer_lateness_capacity: usize = 32;
 
 pub fn r4_app_main(r4_app: *r4os.App) i32 {
     if (!r4std.init(r4_app.startContext())) return r4os.abi.err_no_group;
     var ctx = AppApi.init(r4_app) orelse return r4os.abi.err_no_group;
-    if (hasArg(ctx.sys.argsRaw(), "/SELFTEST")) return runSelfTest(&ctx.sys);
-    var app = App{ .ctx = &ctx };
+    if (hasArg(ctx.sys.argsRaw(), "/SELFTEST")) {
+        const selftest_result = runSelfTest(&ctx.sys);
+        if (selftest_result != 0) return selftest_result;
+        return runRecoveryTest(&ctx);
+    }
+    const args = ctx.sys.argsRaw();
+    const benchmark = hasArg(args, "/BENCHMARK");
+    var app = App{
+        .ctx = &ctx,
+        .benchmark = benchmark,
+        .benchmark_phase = if (!benchmark)
+            .quiet
+        else if (hasArg(args, "/GUI"))
+            .gui
+        else if (hasArg(args, "/RECOVERY"))
+            .recovery
+        else
+            .quiet,
+    };
     return app.run();
 }
+
+const BenchmarkPhase = enum(u8) {
+    quiet = 0,
+    gui = 1,
+    recovery = 2,
+};
+
+const SampleKind = enum {
+    initial,
+    timer,
+    wait_fallback,
+};
+
+const DisplaySnapshot = struct {
+    status: r4os.abi.TimeServiceStatus = .{},
+    valid: bool = false,
+    from_service: bool = false,
+};
+
+const ClockMetrics = struct {
+    started_tick: u64 = 0,
+    wait_calls: u64 = 0,
+    timer_wakes: u64 = 0,
+    load_timer_wakes: u64 = 0,
+    gui_wakes: u64 = 0,
+    wait_failures: u64 = 0,
+    missed_timer_periods: u64 = 0,
+    max_timer_late_ticks: u64 = 0,
+    initial_samples: u64 = 0,
+    timer_samples: u64 = 0,
+    fallback_wait_samples: u64 = 0,
+    service_calls: u64 = 0,
+    service_successes: u64 = 0,
+    service_failures: u64 = 0,
+    open_attempts: u64 = 0,
+    open_successes: u64 = 0,
+    reconnect_successes: u64 = 0,
+    close_attempts: u64 = 0,
+    close_successes: u64 = 0,
+    fallback_samples: u64 = 0,
+    render_attempts: u64 = 0,
+    presented_frames: u64 = 0,
+    second_changes: u64 = 0,
+    format_changes: u64 = 0,
+    zone_changes: u64 = 0,
+    remote_status_first: u64 = 0,
+    remote_status_last: u64 = 0,
+    remote_status_samples: u64 = 0,
+    remote_status_delta_sum: u64 = 0,
+    remote_status_resets: u64 = 0,
+    phase_actions: u64 = 0,
+    phase_action_failures: u64 = 0,
+    recovery_stop_result: i32 = 0,
+    recovery_start_result: i32 = 0,
+};
 
 const App = struct {
     ctx: *AppApi,
     w: i32 = 260,
     h: i32 = 230,
     should_exit: bool = false,
+    benchmark: bool = false,
+    benchmark_phase: BenchmarkPhase = .quiet,
     config: r4std.time.Config = .{},
-    last_second: u32 = r4std.time.seconds_per_day,
-    last_clock_format: u32 = r4os.abi.clock_format_24h,
-    last_config_check: u32 = 0,
+    snapshot: DisplaySnapshot = .{},
+    time_connection: ?r4os.ServiceConnection = null,
+    connected_once: bool = false,
+    last_config_check: u32 = std.math.maxInt(u32),
+    benchmark_deadline_tick: u64 = 0,
+    timer_interval_ticks: u64 = 1,
+    next_timer_tick: u64 = 0,
+    timer_lateness: [timer_lateness_capacity]u64 = .{0} ** timer_lateness_capacity,
+    timer_lateness_count: usize = 0,
+    metrics: ClockMetrics = .{},
 
     fn run(self: *App) i32 {
         if (self.ctx.desk.programWindowId() >= 0) return self.runHosted();
@@ -53,30 +145,139 @@ const App = struct {
     fn runHosted(self: *App) i32 {
         _ = self.ctx.desk.guiSetTitle("Clock");
         _ = self.ctx.desk.guiSetMinSize(240, 220);
+        self.metrics.started_tick = self.ctx.sys.ticks();
+        self.timer_interval_ticks = @max(@as(u64, 1), self.ctx.sys.ticksFromMilliseconds(1000));
+        if (self.benchmark) {
+            const duration_ticks = @max(@as(u64, 1), self.ctx.sys.ticksFromMilliseconds(benchmark_seconds * 1000));
+            self.benchmark_deadline_tick = self.metrics.started_tick +| duration_ticks;
+        }
+        defer if (self.benchmark) self.reportMetrics();
+        defer if (self.benchmark and self.benchmark_phase == .recovery) ensureTimeServiceRunning(&self.ctx.sys);
+        defer self.closeTimeConnection();
+
         self.loadConfig();
         self.updateMetrics();
+        _ = self.refreshSnapshot(.initial);
         self.render();
 
+        var timers: [2]r4os.Timer = .{ .{}, .{} };
+        const timer_ready = timers[0].start(
+            &self.ctx.sys,
+            clock_timer_id,
+            .{ .nanoseconds = clock_second_ns },
+            true,
+        );
+        if (self.benchmark and self.benchmark_phase == .gui) {
+            _ = timers[1].start(
+                &self.ctx.sys,
+                benchmark_gui_timer_id,
+                .{ .nanoseconds = benchmark_gui_interval_ns },
+                true,
+            );
+        }
+        self.next_timer_tick = self.ctx.sys.ticks() +| self.timer_interval_ticks;
+        var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, timers[0..]);
+
         while (!self.ctx.sys.programShouldClose() and !self.should_exit) {
-            var event: r4os.abi.GuiEvent = .{};
-            while (self.ctx.desk.guiPollEvent(&event) > 0) {
-                const kind: r4os.abi.GuiEventKind = @enumFromInt(event.kind);
-                switch (kind) {
-                    .close => return 0,
-                    .resize => {
-                        self.updateMetrics();
-                        self.render();
-                    },
-                    .key_down => {
-                        if (@as(u8, @intCast(event.key & 0xFF)) == r4os.gui.Key.escape) self.should_exit = true;
-                    },
-                    else => {},
-                }
+            self.metrics.wait_calls +%= 1;
+            const timeout: r4os.abi.R4Timeout = if (timer_ready)
+                .{ .kind = r4os.abi.timeout_kind_forever }
+            else
+                .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = clock_second_ns };
+            switch (events.wait(timeout)) {
+                .message => |message| self.handleMessage(message),
+                .timed_out => self.handleTimerWake(self.ctx.sys.ticks(), .wait_fallback),
+                .failure => {
+                    self.metrics.wait_failures +%= 1;
+                    self.ctx.sys.sleepTicks(self.timer_interval_ticks);
+                    self.handleTimerWake(self.ctx.sys.ticks(), .wait_fallback);
+                },
             }
-            if (self.needsTickRender()) self.render();
-            self.ctx.sys.sleepTicks(5);
+            if (self.benchmarkExpired()) self.should_exit = true;
         }
         return 0;
+    }
+
+    fn handleMessage(self: *App, message: r4os.Message) void {
+        switch (message) {
+            .close => {
+                self.metrics.gui_wakes +%= 1;
+                self.should_exit = true;
+            },
+            .resize => {
+                self.metrics.gui_wakes +%= 1;
+                self.updateMetrics();
+                self.render();
+            },
+            .key => |key| {
+                self.metrics.gui_wakes +%= 1;
+                if (key.key == r4os.gui.Key.escape) self.should_exit = true;
+            },
+            .timer => |timer| {
+                if (timer.id.value == clock_timer_id.value) {
+                    self.handleTimerWake(timer.tick, .timer);
+                } else if (timer.id.value == benchmark_gui_timer_id.value) {
+                    self.handleBenchmarkGuiWake();
+                }
+            },
+            else => self.metrics.gui_wakes +%= 1,
+        }
+    }
+
+    fn handleTimerWake(self: *App, tick: u64, sample_kind: SampleKind) void {
+        self.metrics.timer_wakes +%= 1;
+        const late = if (tick > self.next_timer_tick) tick - self.next_timer_tick else 0;
+        if (self.timer_lateness_count < self.timer_lateness.len) {
+            self.timer_lateness[self.timer_lateness_count] = late;
+            self.timer_lateness_count += 1;
+        }
+        if (tick > self.next_timer_tick) {
+            self.metrics.max_timer_late_ticks = @max(self.metrics.max_timer_late_ticks, late);
+            self.metrics.missed_timer_periods +%= late / self.timer_interval_ticks;
+        }
+        const elapsed = if (tick >= self.next_timer_tick) tick - self.next_timer_tick else 0;
+        const periods = elapsed / self.timer_interval_ticks +| 1;
+        self.next_timer_tick +|= periods *| self.timer_interval_ticks;
+        if (sample_kind == .timer and self.benchmark and self.benchmark_phase == .recovery and
+            self.metrics.timer_wakes == 4 and self.metrics.phase_actions == 0)
+        {
+            self.runBenchmarkRecoveryAction();
+        }
+        if (self.refreshSnapshot(sample_kind)) self.render();
+    }
+
+    fn handleBenchmarkGuiWake(self: *App) void {
+        if (!self.benchmark or self.benchmark_phase != .gui) return;
+        self.metrics.load_timer_wakes +%= 1;
+        self.metrics.phase_actions +%= 1;
+        const step: i32 = @intCast(@min(self.metrics.phase_actions, 96));
+        if (self.ctx.desk.guiSetMinSize(440 + step * 2, 250 + step * 2) < 0) {
+            self.metrics.phase_action_failures +%= 1;
+        }
+    }
+
+    fn runBenchmarkRecoveryAction(self: *App) void {
+        self.metrics.phase_actions +%= 1;
+        var info: r4os.abi.ServiceInfo = .{};
+        self.metrics.recovery_stop_result = self.ctx.sys.serviceStop(
+            time_service_name,
+            &info,
+            self.ctx.sys.ticksFromMilliseconds(2000),
+        );
+        if (self.metrics.recovery_stop_result != r4os.abi.service_api_result_ok) {
+            self.metrics.phase_action_failures +%= 1;
+            return;
+        }
+        self.metrics.recovery_start_result = self.ctx.sys.serviceStart(time_service_name, &info);
+        if (self.metrics.recovery_start_result != r4os.abi.service_api_result_ok and
+            self.metrics.recovery_start_result != r4os.abi.service_api_result_running)
+        {
+            self.metrics.phase_action_failures +%= 1;
+        }
+    }
+
+    fn benchmarkExpired(self: *const App) bool {
+        return self.benchmark and self.ctx.sys.ticks() >= self.benchmark_deadline_tick;
     }
 
     fn updateMetrics(self: *App) void {
@@ -87,29 +288,117 @@ const App = struct {
         self.h = clampI32(canvas.h, 220, 520);
     }
 
-    fn needsTickRender(self: *App) bool {
+    fn refreshSnapshot(self: *App, sample_kind: SampleKind) bool {
+        switch (sample_kind) {
+            .initial => self.metrics.initial_samples +%= 1,
+            .timer => self.metrics.timer_samples +%= 1,
+            .wait_fallback => self.metrics.fallback_wait_samples +%= 1,
+        }
+
         const state = self.ctx.sys.timeState();
         const raw = state.seconds_since_midnight;
-        var service_status: r4os.abi.TimeServiceStatus = .{};
-        if (self.ctx.sys.timeServiceStatus(&service_status) == r4os.abi.service_api_result_ok) {
-            const zoned = service_status.local_seconds_since_midnight;
-            const clock_format = @as(u32, service_status.clock_format);
-            if (zoned == self.last_second and clock_format == self.last_clock_format) return false;
-            self.last_second = zoned;
-            self.last_clock_format = clock_format;
-            return true;
+        var next: DisplaySnapshot = .{};
+        if (self.readTimeServiceStatus(&next.status)) {
+            next.valid = true;
+            next.from_service = true;
+        } else {
+            self.metrics.fallback_samples +%= 1;
+            if (raw != self.last_config_check) {
+                self.last_config_check = raw;
+                self.loadConfig();
+            }
+            next.status.local_seconds_since_midnight = r4std.time.secondsInZone(raw, self.config.offsetMinutesForState(state));
+            next.status.clock_format = @intCast(self.config.selectedClockFormat());
+            @memset(next.status.zone_label[0..], 0);
+            _ = r4std.time.copyZoneLabelForState(next.status.zone_label[0..], self.config.selectedIndex(), state);
+            next.valid = true;
         }
-        if (raw % 3 == 0 and raw != self.last_config_check) {
-            self.last_config_check = raw;
-            self.loadConfig();
+
+        const changed = !self.snapshot.valid or displaySnapshotChanged(self.snapshot, next);
+        if (self.snapshot.valid) {
+            if (self.snapshot.status.local_seconds_since_midnight != next.status.local_seconds_since_midnight) self.metrics.second_changes +%= 1;
+            if (self.snapshot.status.clock_format != next.status.clock_format) self.metrics.format_changes +%= 1;
+            if (!std.mem.eql(u8, self.snapshot.status.zone_label[0..], next.status.zone_label[0..])) self.metrics.zone_changes +%= 1;
         }
-        const zoned = r4std.time.secondsInZone(raw, self.config.offsetMinutesForState(state));
-        if (zoned == self.last_second) return false;
-        self.last_second = zoned;
-        return true;
+        self.snapshot = next;
+        return changed;
+    }
+
+    fn readTimeServiceStatus(self: *App, out: *r4os.abi.TimeServiceStatus) bool {
+        if (!self.ensureTimeConnection()) return false;
+        var connection = self.time_connection orelse return false;
+        out.* = .{};
+        self.metrics.service_calls +%= 1;
+        const called = connection.call(
+            r4os.abi.time_service_op_status,
+            "",
+            std.mem.asBytes(out),
+            .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = time_service_timeout_ns },
+        );
+        self.time_connection = if (connection.valid()) connection else null;
+        switch (called) {
+            .response => |response| {
+                if (response.bytes < @sizeOf(r4os.abi.TimeServiceStatus) or
+                    out.magic != r4os.abi.time_service_status_magic or
+                    out.version != r4os.abi.time_service_status_version)
+                {
+                    self.metrics.service_failures +%= 1;
+                    self.closeTimeConnection();
+                    return false;
+                }
+                self.metrics.service_successes +%= 1;
+                if (self.metrics.remote_status_samples == 0) {
+                    self.metrics.remote_status_first = out.status_requests;
+                } else if (out.status_requests >= self.metrics.remote_status_last) {
+                    self.metrics.remote_status_delta_sum +%= out.status_requests - self.metrics.remote_status_last;
+                } else {
+                    self.metrics.remote_status_resets +%= 1;
+                    self.metrics.remote_status_delta_sum +%= out.status_requests;
+                }
+                self.metrics.remote_status_last = out.status_requests;
+                self.metrics.remote_status_samples +%= 1;
+                return true;
+            },
+            .timed_out, .remote_failure, .failure => {
+                self.metrics.service_failures +%= 1;
+                return false;
+            },
+        }
+    }
+
+    fn ensureTimeConnection(self: *App) bool {
+        if (self.time_connection) |connection| {
+            if (connection.valid()) return true;
+            self.time_connection = null;
+        }
+        self.metrics.open_attempts +%= 1;
+        var services = r4os.Services{ .sys = self.ctx.sys };
+        switch (services.open(time_service_name)) {
+            .connection => |connection| {
+                self.time_connection = connection;
+                self.metrics.open_successes +%= 1;
+                if (self.connected_once) self.metrics.reconnect_successes +%= 1;
+                self.connected_once = true;
+                return true;
+            },
+            .failure => {
+                self.metrics.service_failures +%= 1;
+                return false;
+            },
+        }
+    }
+
+    fn closeTimeConnection(self: *App) void {
+        var connection = self.time_connection orelse return;
+        self.time_connection = null;
+        if (!connection.valid()) return;
+        self.metrics.close_attempts +%= 1;
+        if (connection.close() == r4os.abi.service_api_result_ok) self.metrics.close_successes +%= 1;
     }
 
     fn render(self: *App) void {
+        self.metrics.render_attempts +%= 1;
+        if (!self.snapshot.valid) return;
         var paint = switch (r4os.app_gui.beginPaintForSize(&self.ctx.draw, self.w, self.h)) {
             .paint => |value| value,
             .failure => return,
@@ -117,22 +406,10 @@ const App = struct {
         defer paint.discard();
         const canvas = paint.canvas;
         var scratch: [96]u8 = .{0} ** 96;
-        const state = self.ctx.sys.timeState();
-        var service_status: r4os.abi.TimeServiceStatus = .{};
-        const service_ok = self.ctx.sys.timeServiceStatus(&service_status) == r4os.abi.service_api_result_ok;
-        const seconds = if (service_ok)
-            service_status.local_seconds_since_midnight
-        else
-            r4std.time.secondsInZone(state.seconds_since_midnight, self.config.offsetMinutesForState(state));
+        const seconds = self.snapshot.status.local_seconds_since_midnight;
         const time = r4std.time.splitTime(seconds);
-        self.last_second = seconds;
-        const clock_format = if (service_ok) @as(u32, service_status.clock_format) else self.config.selectedClockFormat();
-        self.last_clock_format = clock_format;
-        var zone_label_buffer: [r4std.time.zone_label_max + 1]u8 = .{0} ** (r4std.time.zone_label_max + 1);
-        const zone_label = if (service_ok)
-            spanZ(service_status.zone_label[0..])
-        else
-            r4std.time.copyZoneLabelForState(zone_label_buffer[0..], self.config.selectedIndex(), state);
+        const clock_format = @as(u32, self.snapshot.status.clock_format);
+        const zone_label = spanZ(self.snapshot.status.zone_label[0..]);
 
         _ = canvas.clear(app_bg);
         _ = canvas.groupBox(.{ .rect = .{ .x = 12, .y = 10, .w = self.w - 24, .h = self.h - 62 }, .title = "Clock" }, scratch[0..]);
@@ -142,7 +419,7 @@ const App = struct {
         _ = r4std.time.formatDisplay(hms[0..], time, clock_format);
         _ = canvas.label(.{ .rect = .{ .x = 16, .y = self.h - 44, .w = self.w - 32, .h = 16 }, .text = spanZ(hms[0..]), .alignment = .center, .fg = text, .bg = app_bg }, scratch[0..]);
         _ = canvas.textClipped(16, self.h - 24, self.w - 32, scratch[0..], zone_label, text, app_bg);
-        _ = paint.present();
+        if (paint.present() >= 0) self.metrics.presented_frames +%= 1;
     }
 
     fn drawAnalog(self: *App, canvas: r4os.gui.Canvas, time: r4std.time.ClockTime) void {
@@ -188,7 +465,201 @@ const App = struct {
         const len = self.ctx.sys.fileRead(r4std.settings.paths.time, buffer[0..]);
         if (len > 0) _ = self.config.loadFromBytes(buffer[0..@intCast(len)]);
     }
+
+    fn reportMetrics(self: *const App) void {
+        const lateness = timerStats(self.timer_lateness[0..self.timer_lateness_count]);
+        var buffer: [1024]u8 = undefined;
+        var length: usize = 0;
+        length += (std.fmt.bufPrint(buffer[length..], "CLOCKPERF|2|{d}|{d}|{d}|{d}", .{
+            @intFromEnum(self.benchmark_phase),
+            benchmark_seconds,
+            self.ctx.sys.ticks() -| self.metrics.started_tick,
+            self.ctx.sys.monotonicHz(),
+        }) catch return).len;
+        length += (std.fmt.bufPrint(buffer[length..], "|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}", .{
+            self.metrics.wait_calls,
+            self.metrics.timer_wakes,
+            self.metrics.load_timer_wakes,
+            self.metrics.gui_wakes,
+            self.metrics.wait_failures,
+            self.metrics.missed_timer_periods,
+            lateness.count,
+            lateness.minimum,
+            lateness.p50,
+            lateness.p95,
+            lateness.p99,
+            lateness.maximum,
+            lateness.mean,
+        }) catch return).len;
+        length += (std.fmt.bufPrint(buffer[length..], "|{d}|{d}|{d}", .{
+            self.metrics.initial_samples,
+            self.metrics.timer_samples,
+            self.metrics.fallback_wait_samples,
+        }) catch return).len;
+        length += (std.fmt.bufPrint(buffer[length..], "|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}", .{
+            self.metrics.service_calls,
+            self.metrics.service_successes,
+            self.metrics.service_failures,
+            self.metrics.open_attempts,
+            self.metrics.open_successes,
+            self.metrics.reconnect_successes,
+            self.metrics.close_attempts,
+            self.metrics.close_successes,
+            self.metrics.fallback_samples,
+        }) catch return).len;
+        length += (std.fmt.bufPrint(buffer[length..], "|{d}|{d}|{d}|{d}|{d}", .{
+            self.metrics.render_attempts,
+            self.metrics.presented_frames,
+            self.metrics.second_changes,
+            self.metrics.format_changes,
+            self.metrics.zone_changes,
+        }) catch return).len;
+        length += (std.fmt.bufPrint(buffer[length..], "|{d}|{d}|{d}|{d}|{d}", .{
+            self.metrics.remote_status_samples,
+            self.metrics.remote_status_first,
+            self.metrics.remote_status_last,
+            self.metrics.remote_status_delta_sum,
+            self.metrics.remote_status_resets,
+        }) catch return).len;
+        length += (std.fmt.bufPrint(buffer[length..], "|{d}|{d}|{d}|{d}|{d}", .{
+            self.metrics.phase_actions,
+            self.metrics.phase_action_failures,
+            self.metrics.recovery_stop_result,
+            self.metrics.recovery_start_result,
+            @intFromBool(self.snapshot.from_service),
+        }) catch return).len;
+        const line = buffer[0..length];
+        const line_result = self.ctx.sys.fileAppend(benchmark_output_path, line);
+        const newline_result = self.ctx.sys.fileAppend(benchmark_output_path, "\r\n");
+        if (line_result != @as(i32, @intCast(line.len)) or newline_result != 2) {
+            var error_buffer: [96]u8 = undefined;
+            const error_line = std.fmt.bufPrint(error_buffer[0..], "CLOCKPERFERR|{d}|{d}|{d}\r\n", .{
+                @intFromEnum(self.benchmark_phase),
+                line_result,
+                newline_result,
+            }) catch return;
+            _ = self.ctx.sys.fileWrite(benchmark_error_path, error_line);
+        }
+        self.ctx.sys.println(line);
+    }
 };
+
+const TimerStats = struct {
+    count: usize = 0,
+    minimum: u64 = 0,
+    p50: u64 = 0,
+    p95: u64 = 0,
+    p99: u64 = 0,
+    maximum: u64 = 0,
+    mean: u64 = 0,
+};
+
+fn timerStats(values: []const u64) TimerStats {
+    if (values.len == 0) return .{};
+    var sorted: [timer_lateness_capacity]u64 = .{0} ** timer_lateness_capacity;
+    @memcpy(sorted[0..values.len], values);
+    var index: usize = 1;
+    while (index < values.len) : (index += 1) {
+        const value = sorted[index];
+        var position = index;
+        while (position > 0 and sorted[position - 1] > value) : (position -= 1) {
+            sorted[position] = sorted[position - 1];
+        }
+        sorted[position] = value;
+    }
+    var sum: u64 = 0;
+    for (sorted[0..values.len]) |value| sum +%= value;
+    return .{
+        .count = values.len,
+        .minimum = sorted[0],
+        .p50 = nearestRank(sorted[0..values.len], 50),
+        .p95 = nearestRank(sorted[0..values.len], 95),
+        .p99 = nearestRank(sorted[0..values.len], 99),
+        .maximum = sorted[values.len - 1],
+        .mean = sum / values.len,
+    };
+}
+
+fn nearestRank(sorted: []const u64, percentile: usize) u64 {
+    const rank = (percentile * sorted.len + 99) / 100;
+    return sorted[@max(rank, 1) - 1];
+}
+
+fn displaySnapshotChanged(previous: DisplaySnapshot, next: DisplaySnapshot) bool {
+    return previous.status.local_seconds_since_midnight != next.status.local_seconds_since_midnight or
+        previous.status.clock_format != next.status.clock_format or
+        !std.mem.eql(u8, previous.status.zone_label[0..], next.status.zone_label[0..]);
+}
+
+fn runRecoveryTest(ctx: *AppApi) i32 {
+    ctx.sys.println("CLOCK recovery test");
+    var app = App{ .ctx = ctx };
+    app.loadConfig();
+    defer ensureTimeServiceRunning(&ctx.sys);
+    defer app.closeTimeConnection();
+
+    var status: r4os.abi.TimeServiceStatus = .{};
+    if (!app.readTimeServiceStatus(&status)) return fail(&ctx.sys, "initial-service");
+    ctx.sys.println("CLOCK recovery: initial connection OK");
+
+    var info: r4os.abi.ServiceInfo = .{};
+    ctx.sys.println("CLOCK recovery: stopping TIMESVC");
+    const stop = ctx.sys.serviceStop(time_service_name, &info, ctx.sys.ticksFromMilliseconds(2000));
+    if (stop != r4os.abi.service_api_result_ok) return fail(&ctx.sys, "service-stop");
+    ctx.sys.println("CLOCK recovery: TIMESVC stopped");
+
+    var unavailable: r4os.abi.TimeServiceStatus = .{};
+    if (app.readTimeServiceStatus(&unavailable)) return fail(&ctx.sys, "stale-service");
+    if (app.time_connection != null) return fail(&ctx.sys, "stale-connection");
+    _ = app.refreshSnapshot(.timer);
+    if (!app.snapshot.valid or app.snapshot.from_service) return fail(&ctx.sys, "fallback");
+    ctx.sys.println("CLOCK recovery: fallback OK");
+
+    const start = ctx.sys.serviceStart(time_service_name, &info);
+    if (start != r4os.abi.service_api_result_ok and start != r4os.abi.service_api_result_running) {
+        return fail(&ctx.sys, "service-start");
+    }
+
+    var recovered = false;
+    var tick: u32 = 0;
+    while (tick < 160) : (tick += 1) {
+        if (app.readTimeServiceStatus(&status)) {
+            recovered = true;
+            break;
+        }
+        ctx.sys.sleepTicks(1);
+    }
+    if (!recovered) return fail(&ctx.sys, "reconnect");
+    if (app.metrics.open_successes < 2 or app.metrics.reconnect_successes == 0) {
+        return fail(&ctx.sys, "reconnect-accounting");
+    }
+    app.closeTimeConnection();
+    app.closeTimeConnection();
+    if (app.metrics.close_attempts != 1 or app.metrics.close_successes != 1) {
+        return fail(&ctx.sys, "idempotent-close");
+    }
+
+    ctx.sys.println("CLOCK recovery: reconnect OK");
+    ctx.sys.println("CLOCK recovery test: OK");
+    return 0;
+}
+
+fn ensureTimeServiceRunning(ctx: *const r4os.r4sys.Context) void {
+    var tick: u32 = 0;
+    while (tick < 160) : (tick += 1) {
+        var info: r4os.abi.ServiceInfo = .{};
+        const status = ctx.serviceStatus(time_service_name, &info);
+        if (status == r4os.abi.service_api_result_ok and info.state == r4os.abi.service_state_running) return;
+        if (status == r4os.abi.service_api_result_ok and
+            info.state != r4os.abi.service_state_starting and
+            info.state != r4os.abi.service_state_stopping)
+        {
+            const start = ctx.serviceStart(time_service_name, &info);
+            if (start != r4os.abi.service_api_result_ok and start != r4os.abi.service_api_result_running) return;
+        }
+        ctx.sleepTicks(1);
+    }
+}
 
 fn runSelfTest(ctx: *const r4os.r4sys.Context) i32 {
     ctx.println("CLOCK selftest");
@@ -203,6 +674,26 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context) i32 {
     if (spanZ(status.zone_label[0..]).len == 0) return fail(ctx, "zone-label");
     if (samePoint(pointForMinute(0, 60), pointForMinute(1, 60))) return fail(ctx, "second-step");
     if (samePoint(pointForMinute(5, 60), pointForMinute(6, 60))) return fail(ctx, "minute-step");
+    var first = DisplaySnapshot{ .valid = true };
+    first.status.local_seconds_since_midnight = 42;
+    first.status.clock_format = @intCast(r4os.abi.clock_format_24h);
+    first.status.zone_label[0] = 'A';
+    var second = first;
+    if (displaySnapshotChanged(first, second)) return fail(ctx, "snapshot-stable");
+    second.status.local_seconds_since_midnight += 1;
+    if (!displaySnapshotChanged(first, second)) return fail(ctx, "snapshot-second");
+    second = first;
+    second.status.clock_format = @intCast(r4os.abi.clock_format_12h);
+    if (!displaySnapshotChanged(first, second)) return fail(ctx, "snapshot-format");
+    second = first;
+    second.status.zone_label[0] = 'B';
+    if (!displaySnapshotChanged(first, second)) return fail(ctx, "snapshot-zone");
+    const lateness = timerStats(&.{ 5, 1, 9, 3 });
+    if (lateness.count != 4 or lateness.minimum != 1 or lateness.p50 != 3 or
+        lateness.p95 != 9 or lateness.p99 != 9 or lateness.maximum != 9 or lateness.mean != 4)
+    {
+        return fail(ctx, "timer-stats");
+    }
     ctx.write("CLOCK display ");
     ctx.write(text_value);
     ctx.write(" ");
@@ -294,7 +785,7 @@ fn spanZ(buffer: []const u8) []const u8 {
 }
 
 fn fail(ctx: *const r4os.r4sys.Context, label: []const u8) i32 {
-    ctx.write("CLOCK selftest FAILED: ");
+    ctx.write("CLOCK test FAILED: ");
     ctx.println(label);
     return 1;
 }

@@ -3,6 +3,29 @@
 
 CLOCK.R4X ist die gehostete Desktop-Uhr-App.
 
+Laufzeit:
+- Die App wartet mit dem gemeinsamen `app_gui.EventLoop` auf Desktopaktivitaet
+  oder die naechste Sekundentimer-Deadline; die alte 5-Tick-Pollschleife
+  existiert nicht mehr.
+- Eine langlebige `app_services.ServiceConnection` liest pro Initialisierung
+  beziehungsweise Sekundentimer genau einen validierten TIMESVC-Snapshot.
+  Aenderungsentscheidung und Render verwenden denselben Snapshot; Resize
+  erzeugt keinen zusaetzlichen Servicecall.
+- Bei Ausfall oder Neustart von TIMESVC bleibt der lokale R4STD-Fallback aktiv.
+  Wiederverbindungsversuche sind auf den Sekundentakt begrenzt und der Handle
+  wird beim Programmende genau einmal geschlossen.
+- `/BENCHMARK` fuehrt den gehosteten Pfad zehn Sekunden aus. `/GUI` erzeugt
+  ueber einen 100-ms-Lasttimer echte Resize-Ereignisse, `/RECOVERY` genau einen
+  kontrollierten TIMESVC-Stop/Start. Jede Ausfuehrung schreibt eine numerische
+  `CLOCKPERF|2`-Zeile nach `D:\CLOCKPERF.TXT` auf dem beschreibbaren
+  Benchmark-Datenlaufwerk; enthalten sind getrennte
+  Phasen-, Wait-, Sekunden-/Lasttimer-, GUI-, Service-, Verbindungs-, Fallback-,
+  Render- und Aenderungszaehler sowie min/p50/p95/p99/max/mean der
+  Sekundentimerabweichung.
+- `/SELFTEST` prueft zusaetzlich Service-Stopp, lokalen Fallback, Invalidierung
+  des alten Handles, Neustart und begrenzte Wiederverbindung und stellt
+  TIMESVC vor dem Ende wieder her.
+
 Projektstruktur:
 - `build.zig` baut die App als eigenes SDK-Projekt.
 - `build.zig.zon` pinnt SDK und R4OS-Librarybindings als Pakete.
