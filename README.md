@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.3`
+- Version: `0.1.5`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/CLOCK.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
