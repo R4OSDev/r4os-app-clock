@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.6`
+- Version: `0.1.10`
 - Image target: `/R4OS/SOFTWARE/DESKTOP/CLOCK.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -66,3 +66,14 @@ Detailed German technical notes from the migration are preserved in
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+
+API migration 0.90.68
+---------------------
+The normal SDK201/Contract93/Libraries57 build selects App2 and platform
+Query2 plus the technical R4STD Query2 entry. TIME_V1 retains its library ABI.
+The shared argument cursor reads the whole argument string. Clock requests
+use ServiceConnection with a checked absolute budget and publish only an
+exact validated reply. Absolute timer deadlines use the canonical rebased
+ticks provider. Clock samples validate identity, frequency and forward time.
+A changed/unavailable clock or wait failure ends the caller with its error.
+TIME.R4S reads bind full metadata. Font changes rebuild layout and Canvas.

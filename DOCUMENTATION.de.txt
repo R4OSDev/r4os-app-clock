@@ -52,3 +52,13 @@ Contract:
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\DESKTOP\CLOCK.R4X`
 
 Herkunft und Transfergrenzen stehen in `PROVENANCE.txt`.
+
+API-Migration 0.90.68
+---------------------
+Clock10 verwendet App2/Query2 und den normalen SDK201-/Contract93-/Library57-
+Satz. Ganze Argumente werden ueber ArgumentCursor gelesen. Ein absoluter
+RPC-Budgetwert begrenzt TIMESVC. Nur vollstaendige gepruefte Antworten werden
+uebernommen. Absolute Timer verwenden den kanonischen rebasierenden Tick-
+Provider. ClockSample prueft Identitaet, Frequenz und vorwaerts laufende Zeit.
+Fehler beenden den Aufrufer mit ihrem Status. TIME.R4S wird durch ganze
+Metadatenbeobachtungen gebunden. Fontwechsel baut Canvas und Layout neu auf.

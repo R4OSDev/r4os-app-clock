@@ -1,20 +1,17 @@
 const std = @import("std");
 const r4os = @import("r4os");
 const r4std = @import("r4std");
+const checked_time = r4os.time_contract.checked;
 const AppApi = struct {
     sys: r4os.r4sys.Context,
     desk: r4os.r4desk.Context,
     draw: r4os.r4draw.Context,
-    net: r4os.r4net.Context,
-    dev: r4os.r4dev.Context,
 
-    fn init(r4_app: *r4os.App) ?AppApi {
+    fn init(r4_app: *r4os.App2) ?AppApi {
         return .{
             .sys = r4_app.system(),
             .desk = r4_app.desktop() orelse return null,
             .draw = r4_app.drawing() orelse return null,
-            .net = r4_app.networkLowLevel() orelse return null,
-            .dev = r4_app.devicesLowLevel() orelse return null,
         };
     }
 };
@@ -36,24 +33,27 @@ const time_service_timeout_ns: u64 = 1_000_000_000;
 const benchmark_seconds: u64 = 10;
 const timer_lateness_capacity: usize = 32;
 
-pub fn r4_app_main(r4_app: *r4os.App) i32 {
-    if (!r4std.init(r4_app.startContext())) return r4os.abi.err_no_group;
+pub fn r4_app_main(r4_app: *r4os.App2) i32 {
+    if (!r4std.init2(r4_app.startContext())) return r4os.abi.err_no_group;
     var ctx = AppApi.init(r4_app) orelse return r4os.abi.err_no_group;
-    if (hasArg(ctx.sys.argsRaw(), "/SELFTEST")) {
+    const options = parseOptions(r4_app.args()) catch |err| {
+        ctx.sys.println("CLOCK invalid arguments");
+        return r4os.arguments.code(err);
+    };
+    if (options.selftest) {
         const selftest_result = runSelfTest(&ctx.sys);
         if (selftest_result != 0) return selftest_result;
         return runRecoveryTest(&ctx);
     }
-    const args = ctx.sys.argsRaw();
-    const benchmark = hasArg(args, "/BENCHMARK");
+    const benchmark = options.benchmark;
     var app = App{
         .ctx = &ctx,
         .benchmark = benchmark,
         .benchmark_phase = if (!benchmark)
             .quiet
-        else if (hasArg(args, "/GUI"))
+        else if (options.gui)
             .gui
-        else if (hasArg(args, "/RECOVERY"))
+        else if (options.recovery)
             .recovery
         else
             .quiet,
@@ -130,6 +130,7 @@ const App = struct {
     last_config_check: u32 = std.math.maxInt(u32),
     benchmark_deadline_tick: u64 = 0,
     timer_interval_ticks: u64 = 1,
+    clock_sample: ?checked_time.ClockSample = null,
     next_timer_tick: u64 = 0,
     timer_lateness: [timer_lateness_capacity]u64 = .{0} ** timer_lateness_capacity,
     timer_lateness_count: usize = 0,
@@ -145,11 +146,12 @@ const App = struct {
     fn runHosted(self: *App) i32 {
         _ = self.ctx.desk.guiSetTitle("Clock");
         _ = self.ctx.desk.guiSetMinSize(240, 220);
-        self.metrics.started_tick = self.ctx.sys.ticks();
-        self.timer_interval_ticks = @max(@as(u64, 1), self.ctx.sys.ticksFromMilliseconds(1000));
+        self.metrics.started_tick = self.checkedTick() catch |err| return checked_time.failure(err);
+        const frequency = self.clock_sample.?.identity.tick_hz;
+        self.timer_interval_ticks = checked_time.durationToTicks(.{ .nanoseconds = clock_second_ns }, frequency) catch |err| return checked_time.failure(err);
         if (self.benchmark) {
-            const duration_ticks = @max(@as(u64, 1), self.ctx.sys.ticksFromMilliseconds(benchmark_seconds * 1000));
-            self.benchmark_deadline_tick = self.metrics.started_tick +| duration_ticks;
+            const duration_ticks = checked_time.durationToTicks(.{ .nanoseconds = benchmark_seconds * clock_second_ns }, frequency) catch |err| return checked_time.failure(err);
+            self.benchmark_deadline_tick = std.math.add(u64, self.metrics.started_tick, duration_ticks) catch return checked_time.failure(error.BudgetOverflow);
         }
         defer if (self.benchmark) self.reportMetrics();
         defer if (self.benchmark and self.benchmark_phase == .recovery) ensureTimeServiceRunning(&self.ctx.sys);
@@ -175,7 +177,8 @@ const App = struct {
                 true,
             );
         }
-        self.next_timer_tick = self.ctx.sys.ticks() +| self.timer_interval_ticks;
+        const armed_tick = self.checkedTick() catch |err| return checked_time.failure(err);
+        self.next_timer_tick = std.math.add(u64, armed_tick, self.timer_interval_ticks) catch return checked_time.failure(error.BudgetOverflow);
         var events = r4os.EventLoop.init(self.ctx.sys, self.ctx.desk, timers[0..]);
 
         while (!self.ctx.sys.programShouldClose() and !self.should_exit) {
@@ -184,18 +187,32 @@ const App = struct {
                 .{ .kind = r4os.abi.timeout_kind_forever }
             else
                 .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = clock_second_ns };
-            switch (events.wait(timeout)) {
+            const waited = events.wait(timeout);
+            const observed_tick = self.checkedTick() catch |err| return checked_time.failure(err);
+            switch (waited) {
                 .message => |message| self.handleMessage(message),
-                .timed_out => self.handleTimerWake(self.ctx.sys.ticks(), .wait_fallback),
-                .failure => {
+                .timed_out => self.handleTimerWake(observed_tick, .wait_fallback),
+                .failure => |raw| {
                     self.metrics.wait_failures +%= 1;
-                    self.ctx.sys.sleepTicks(self.timer_interval_ticks);
-                    self.handleTimerWake(self.ctx.sys.ticks(), .wait_fallback);
+                    return raw;
                 },
             }
             if (self.benchmarkExpired()) self.should_exit = true;
         }
         return 0;
+    }
+
+    fn checkedTick(self: *App) checked_time.Error!u64 {
+        const sample = try self.ctx.sys.base.clockSampleChecked();
+        if (self.clock_sample) |previous| {
+            if (!std.meta.eql(previous.identity, sample.identity)) return error.ClockChanged;
+            if (sample.instant_ns < previous.instant_ns) return error.ClockRegressed;
+        }
+        if (sample.identity.tick_hz == 0) return error.UnknownFrequency;
+        self.clock_sample = sample;
+        // Absolute deadlines use the canonical ticks provider's rebased epoch.
+        // ClockSample.ticks() is only a relative-budget coordinate.
+        return self.ctx.sys.ticks();
     }
 
     fn handleMessage(self: *App, message: r4os.Message) void {
@@ -204,7 +221,7 @@ const App = struct {
                 self.metrics.gui_wakes +%= 1;
                 self.should_exit = true;
             },
-            .resize => {
+            .resize, .font_changed => {
                 self.metrics.gui_wakes +%= 1;
                 self.updateMetrics();
                 self.render();
@@ -325,27 +342,28 @@ const App = struct {
     }
 
     fn readTimeServiceStatus(self: *App, out: *r4os.abi.TimeServiceStatus) bool {
+        const context = self.ctx.sys.base.generation2 orelse return false;
+        const clock = r4os.inventory_reader.PlatformClock.fromContext2(context) catch return false;
+        var budget = r4os.rpc_budget.Budget.fromTimeout(clock.read, r4os.time_contract.timeoutFinite(.{ .nanoseconds = time_service_timeout_ns })) catch return false;
         if (!self.ensureTimeConnection()) return false;
         var connection = self.time_connection orelse return false;
-        out.* = .{};
+        var value: r4os.abi.TimeServiceStatus = .{};
         self.metrics.service_calls +%= 1;
-        const called = connection.call(
-            r4os.abi.time_service_op_status,
-            "",
-            std.mem.asBytes(out),
-            .{ .kind = r4os.abi.timeout_kind_finite, .nanoseconds = time_service_timeout_ns },
-        );
+        const called = connection.callBudget(r4os.abi.time_service_op_status, "", std.mem.asBytes(&value), &budget);
         self.time_connection = if (connection.valid()) connection else null;
         switch (called) {
             .response => |response| {
-                if (response.bytes < @sizeOf(r4os.abi.TimeServiceStatus) or
-                    out.magic != r4os.abi.time_service_status_magic or
-                    out.version != r4os.abi.time_service_status_version)
+                if (response.bytes != @sizeOf(r4os.abi.TimeServiceStatus) or
+                    value.magic != r4os.abi.time_service_status_magic or
+                    value.version != r4os.abi.time_service_status_version or
+                    value.timezone_index >= r4std.time.zoneCount() or
+                    (value.clock_format != r4os.abi.clock_format_12h and value.clock_format != r4os.abi.clock_format_24h))
                 {
                     self.metrics.service_failures +%= 1;
                     self.closeTimeConnection();
                     return false;
                 }
+                out.* = value;
                 self.metrics.service_successes +%= 1;
                 if (self.metrics.remote_status_samples == 0) {
                     self.metrics.remote_status_first = out.status_requests;
@@ -462,8 +480,21 @@ const App = struct {
 
     fn loadConfig(self: *App) void {
         var buffer: [768]u8 = undefined;
+        const files = r4os.Files{ .sys = self.ctx.sys };
+        const path = r4os.app_storage.PathZ{ .ptr = r4std.settings.paths.time, .len = r4std.settings.paths.time.len };
+        const before = switch (files.metadata(path)) {
+            .found => |value| value,
+            else => return,
+        };
+        if (before.flags & r4os.abi.file_metadata2_flag_directory != 0 or before.flags & r4os.abi.file_metadata2_flag_byte_size_valid == 0 or before.byte_size > buffer.len) return;
         const len = self.ctx.sys.fileRead(r4std.settings.paths.time, buffer[0..]);
-        if (len > 0) _ = self.config.loadFromBytes(buffer[0..@intCast(len)]);
+        if (len <= 0 or len != before.byte_size) return;
+        const after = switch (files.metadata(path)) {
+            .found => |value| value,
+            else => return,
+        };
+        if (!std.meta.eql(before, after)) return;
+        _ = self.config.loadFromBytes(buffer[0..@intCast(len)]);
     }
 
     fn reportMetrics(self: *const App) void {
@@ -790,15 +821,19 @@ fn fail(ctx: *const r4os.r4sys.Context, label: []const u8) i32 {
     return 1;
 }
 
-fn hasArg(args: [*:0]const u8, wanted: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < 256 and args[offset] != 0) {
-        while (offset < 256 and (args[offset] == ' ' or args[offset] == '\t')) : (offset += 1) {}
-        const start = offset;
-        while (offset < 256 and args[offset] != 0 and args[offset] != ' ' and args[offset] != '\t') : (offset += 1) {}
-        if (equalsIgnoreCase(args[start..offset], wanted)) return true;
+const Options = struct { selftest: bool = false, benchmark: bool = false, gui: bool = false, recovery: bool = false };
+fn parseOptions(args: []const u8) r4os.arguments.Error!Options {
+    var detail: r4os.arguments.Failure = .{};
+    var cursor = try r4os.arguments.ArgCursor.init(args, .{ .quotes = 0, .switches = 0 }, &detail);
+    var result: Options = .{};
+    while (try cursor.next()) |part| {
+        const value = try part.bytes(args);
+        if (equalsIgnoreCase(value, "/SELFTEST")) result.selftest = true;
+        if (equalsIgnoreCase(value, "/BENCHMARK")) result.benchmark = true;
+        if (equalsIgnoreCase(value, "/GUI")) result.gui = true;
+        if (equalsIgnoreCase(value, "/RECOVERY")) result.recovery = true;
     }
-    return false;
+    return result;
 }
 
 fn equalsIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -812,4 +847,100 @@ fn equalsIgnoreCase(a: []const u8, b: []const u8) bool {
 
 fn upper(ch: u8) u8 {
     return if (ch >= 'a' and ch <= 'z') ch - 32 else ch;
+}
+
+test "migration clock whole options and checked canonical tick epoch" {
+    const prefix = [_]u8{'x'} ** 300;
+    const options = try parseOptions(prefix ++ " /BENCHMARK /GUI");
+    try std.testing.expect(options.benchmark and options.gui and !options.selftest and !options.recovery);
+    try std.testing.expectError(error.InvalidEncoding, parseOptions("\xff"));
+    const a = r4os.abi;
+    const Peer = struct {
+        var generation: u32 = 7;
+        var instant: u64 = 1_000_000_000;
+        fn clock(output: *a.MonotonicClockInfo) callconv(.c) i32 {
+            output.* = .{ .flags = a.monotonic_clock_flag_valid, .source = 1, .generation = generation, .instant_ns = instant, .resolution_ns = 1, .event_requested_hz = 1000, .event_effective_hz = 1000 };
+            return 1;
+        }
+        fn ticks() callconv(.c) u64 {
+            return 19;
+        }
+    };
+    Peer.generation = 7;
+    Peer.instant = 1_000_000_000;
+    const platform = r4os.platform2;
+    var table = platform.abi.R4XStartR4Sys2{ .monotonic_clock = @intFromPtr(&Peer.clock), .ticks = @intFromPtr(&Peer.ticks) };
+    const imports = [_]platform.abi.R4XStartImport{.{ .group_id = 1, .resolved_version = 2, .table = @intFromPtr(&table) }};
+    const raw = platform.abi.R4XStartContext2{ .import_count = 1, .imports = @intFromPtr(&imports) };
+    const context = try platform.Context.init(&raw);
+    var api = AppApi{ .sys = r4os.r4sys.Context.fromProgram(.{ .generation2 = &context }), .desk = undefined, .draw = undefined };
+    var app = App{ .ctx = &api };
+    try std.testing.expectEqual(@as(u64, 19), try app.checkedTick());
+    const before = app.clock_sample;
+    Peer.instant -= 1;
+    try std.testing.expectError(error.ClockRegressed, app.checkedTick());
+    try std.testing.expectEqualDeep(before, app.clock_sample);
+    Peer.instant += 1;
+    Peer.generation += 1;
+    try std.testing.expectError(error.ClockChanged, app.checkedTick());
+    try std.testing.expectEqualDeep(before, app.clock_sample);
+}
+
+test "migration clock RPC leaves output intact on short or timed out reply" {
+    const a = r4os.abi;
+    const Peer = struct {
+        var available = false;
+        var short = false;
+        var opens: usize = 0;
+        var calls: usize = 0;
+        fn clock(output: *a.MonotonicClockInfo) callconv(.c) i32 {
+            if (!available) return 0;
+            output.* = .{ .flags = a.monotonic_clock_flag_valid, .source = 1, .generation = 7, .instant_ns = 1_000_000_000, .resolution_ns = 1, .event_requested_hz = 1000, .event_effective_hz = 1000 };
+            return 1;
+        }
+        fn open(_: [*:0]const u8, output: *a.ServiceInfo) callconv(.c) i32 {
+            opens += 1;
+            output.* = .{ .handle = 7 };
+            return a.service_api_result_ok;
+        }
+        fn close(_: u32) callconv(.c) i32 {
+            return a.service_api_result_ok;
+        }
+        fn call(handle: u32, operation: u16, _: [*]const u8, size: u32, header: *a.ServiceMessageHeader, output: [*]u8, capacity: u32, timeout: u64) callconv(.c) i32 {
+            calls += 1;
+            if (handle != 7 or operation != a.time_service_op_status or size != 0 or timeout == 0 or timeout == a.io_wait_forever) return a.service_api_result_invalid;
+            header.* = .{};
+            if (short) {
+                if (capacity == 0) return a.service_api_result_invalid;
+                output[0] = 0;
+                return 1;
+            }
+            return a.service_api_result_timeout;
+        }
+    };
+    Peer.available = false;
+    Peer.short = false;
+    Peer.opens = 0;
+    Peer.calls = 0;
+    const platform = r4os.platform2;
+    var table = platform.abi.R4XStartR4Sys2{ .monotonic_clock = @intFromPtr(&Peer.clock), .service_open = @intFromPtr(&Peer.open), .service_close = @intFromPtr(&Peer.close), .service_call = @intFromPtr(&Peer.call) };
+    const imports = [_]platform.abi.R4XStartImport{.{ .group_id = 1, .resolved_version = 2, .table = @intFromPtr(&table) }};
+    const raw = platform.abi.R4XStartContext2{ .import_count = 1, .imports = @intFromPtr(&imports) };
+    const context = try platform.Context.init(&raw);
+    var api = AppApi{ .sys = r4os.r4sys.Context.fromProgram(.{ .generation2 = &context }), .desk = undefined, .draw = undefined };
+    var app = App{ .ctx = &api };
+    defer app.closeTimeConnection();
+    var output: a.TimeServiceStatus = .{};
+    output.last_error[0] = 'Q';
+    const before = output;
+    try std.testing.expect(!app.readTimeServiceStatus(&output));
+    try std.testing.expectEqual(@as(usize, 0), Peer.opens);
+    Peer.available = true;
+    try std.testing.expect(!app.readTimeServiceStatus(&output));
+    try std.testing.expectEqual(@as(usize, 1), Peer.calls);
+    try std.testing.expectEqualDeep(before, output);
+    Peer.short = true;
+    try std.testing.expect(!app.readTimeServiceStatus(&output));
+    try std.testing.expectEqual(@as(usize, 2), Peer.calls);
+    try std.testing.expectEqualDeep(before, output);
 }
