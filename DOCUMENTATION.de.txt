@@ -47,8 +47,8 @@ oder absolut angegeben werden. Der Build verwendet die gepinnte
 Contract:
 - R4XStart-Entry: `clock_main`
 - App-Klasse: `gui`
-- R4L-Imports: `R4SYS:Query:1`, `R4DESK:Query:1`, `R4DRAW:Query:1`,
-  `R4NET:Query:1`, `R4DEV:Query:1`, `R4STD:TIME_V1:1`
+- Platform-Imports: `R4SYS:Query2:2`, `R4DESK:Query2:2`, `R4DRAW:Query2:2`,
+  `R4NET:Query2:2`, `R4DEV:Query2:2`, `R4STD:TIME_V1:1`
 - Zielpfad im Image: `C:\R4OS\SOFTWARE\DESKTOP\CLOCK.R4X`
 
 Herkunft und Transfergrenzen stehen in `PROVENANCE.txt`.
